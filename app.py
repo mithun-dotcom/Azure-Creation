@@ -353,6 +353,7 @@ async def start_job(token: str, body: JobRequest, background_tasks: BackgroundTa
     JOBS[job_id] = {
         "id": job_id,
         "status": "queued",
+        "control": None,
         "logs": [],
         "results": [],
         "total": len(assignments),
@@ -375,47 +376,87 @@ def get_job(token: str, job_id: str):
 
 
 @app.get("/api/session/{token}/job/{job_id}/report")
-def get_job_report(token: str, job_id: str):
+def get_job_report(token: str, job_id: str, includePassword: int = 0):
     get_session(token)
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(
-        [
-            "Index",
-            "PrimarySmtpAddress",
-            "AssignedOwner",
-            "Created",
-            "FullAccess",
-            "SendAs",
-            "SendOnBehalf",
-            "SignInUnblocked",
-            "PasswordSet",
-            "Error",
-        ]
-    )
+    header = [
+        "Index",
+        "PrimarySmtpAddress",
+        "AssignedOwner",
+        "Created",
+        "FullAccess",
+        "SendAs",
+        "SendOnBehalf",
+        "SignInUnblocked",
+        "PasswordSet",
+        "Error",
+    ]
+    if includePassword:
+        header.append("Password")
+    w.writerow(header)
     for r in job.get("results", []):
-        w.writerow(
-            [
-                r.get("idx"),
-                r.get("smtp", ""),
-                r.get("owner", ""),
-                r.get("create") or "",
-                r.get("fullaccess") or "",
-                r.get("sendas") or "",
-                r.get("sendonbehalf") or "",
-                r.get("signinUnblocked") or "",
-                r.get("passwordSet") or "",
-                r.get("error") or "",
-            ]
-        )
+        row = [
+            r.get("idx"),
+            r.get("smtp", ""),
+            r.get("owner", ""),
+            r.get("create") or "",
+            r.get("fullaccess") or "",
+            r.get("sendas") or "",
+            r.get("sendonbehalf") or "",
+            r.get("signinUnblocked") or "",
+            r.get("passwordSet") or "",
+            r.get("error") or "",
+        ]
+        if includePassword:
+            row.append(r.get("password") or "")
+        w.writerow(row)
+    suffix = "-with-passwords" if includePassword else ""
     return Response(
         content=out.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=mailbox-job-{job_id}.csv"},
+        headers={"Content-Disposition": f"attachment; filename=mailbox-job-{job_id}{suffix}.csv"},
     )
+
+
+@app.post("/api/session/{token}/job/{job_id}/pause")
+def pause_job(token: str, job_id: str):
+    get_session(token)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["status"] not in ("queued", "running"):
+        raise HTTPException(400, f"Cannot pause job in status '{job['status']}'")
+    job["control"] = "pause"
+    return {"status": "pause-requested"}
+
+
+@app.post("/api/session/{token}/job/{job_id}/resume")
+def resume_job(token: str, job_id: str):
+    get_session(token)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["status"] != "paused":
+        raise HTTPException(400, f"Cannot resume job in status '{job['status']}'")
+    job["control"] = "resume"
+    job["status"] = "running"
+    return {"status": "resumed"}
+
+
+@app.post("/api/session/{token}/job/{job_id}/stop")
+def stop_job(token: str, job_id: str):
+    get_session(token)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["status"] not in ("queued", "running", "paused"):
+        raise HTTPException(400, f"Cannot stop job in status '{job['status']}'")
+    job["control"] = "stop"
+    return {"status": "stop-requested"}
 
 
 # ---------------------------------------------------------------------------
@@ -475,17 +516,12 @@ async def _run_job(job_id: str, assignments: List[dict]) -> None:
     # All in ONE PowerShell session to avoid reconnection overhead.
     # ---------------------------------------------------------------------------
 
-    actions = ""
-    for i, a in enumerate(assignments):
+    def build_action(i: int, a: dict) -> str:
         m = _normalize_row(a["mailbox"])
         owner = a["owner"]
         smtp = m["PrimarySmtpAddress"]
         password = m["Password"]
-        if not smtp:
-            _log(job_id, "error", f"[{i+1}] CSV row missing PrimarySmtpAddress — skipped")
-            continue
-
-        actions += f"""
+        return f"""
 $idx = {i}
 $smtp = '{ps_escape(smtp)}'
 $owner = '{ps_escape(owner)}'
@@ -559,8 +595,6 @@ try {
 Disconnect-ExchangeOnline -Confirm:$false | Out-Null
 """
 
-    full_script = _connect_block(cert_path, cert_pw, organization, app_id) + actions + finalize
-
     # Per-mailbox state tracker
     per: Dict[int, dict] = {
         i: {
@@ -569,6 +603,7 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
             "upn": None,
             "userId": None,
             "owner": a["owner"],
+            "password": _normalize_row(a["mailbox"]).get("Password", ""),
             "create": None,
             "fullaccess": None,
             "sendas": None,
@@ -628,11 +663,11 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
 
     loop = asyncio.get_event_loop()
 
-    def run_pwsh_stream() -> int:
+    def run_pwsh_script(script: str) -> int:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".ps1", delete=False, encoding="utf-8"
         ) as f:
-            f.write(full_script)
+            f.write(script)
             script_path = f.name
         try:
             proc = subprocess.Popen(
@@ -652,17 +687,65 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
             except OSError:
                 pass
 
-    try:
-        rc = await loop.run_in_executor(None, run_pwsh_stream)
-    except Exception as e:
-        _log(job_id, "error", f"PowerShell execution error: {e}")
-        job["status"] = "failed"
-        job["finished_at"] = datetime.utcnow().isoformat() + "Z"
-        return
+    CHUNK_SIZE = 5
+    valid_indices = [i for i, a in enumerate(assignments) if per[i]["smtp"]]
+    for i, a in enumerate(assignments):
+        if not per[i]["smtp"]:
+            _log(job_id, "error", f"[{i+1}] CSV row missing PrimarySmtpAddress — skipped")
 
-    if rc != 0:
-        _log(job_id, "warning", f"PowerShell exited with code {rc}")
+    stopped = False
+    for chunk_start in range(0, len(valid_indices), CHUNK_SIZE):
+        chunk = valid_indices[chunk_start:chunk_start + CHUNK_SIZE]
 
+        # Check for pause/stop before starting this chunk
+        while True:
+            ctl = job.get("control")
+            if ctl == "stop":
+                stopped = True
+                _log(job_id, "warning", "Job stopped by user")
+                break
+            if ctl == "pause":
+                if job["status"] != "paused":
+                    job["status"] = "paused"
+                    _log(job_id, "info", "Job paused")
+                await asyncio.sleep(1)
+                continue
+            if job["status"] == "paused":
+                job["status"] = "running"
+                _log(job_id, "info", "Job resumed")
+            job["control"] = None
+            break
+
+        if stopped:
+            break
+
+        actions = "".join(build_action(i, assignments[i]) for i in chunk)
+        chunk_script = _connect_block(cert_path, cert_pw, organization, app_id) + actions + "Disconnect-ExchangeOnline -Confirm:$false | Out-Null\n"
+
+        try:
+            rc = await loop.run_in_executor(None, run_pwsh_script, chunk_script)
+        except Exception as e:
+            _log(job_id, "error", f"PowerShell execution error: {e}")
+            for i in chunk:
+                if not per[i]["error"]:
+                    per[i]["error"] = str(e)
+            continue
+
+        if rc != 0:
+            _log(job_id, "warning", f"PowerShell exited with code {rc} for this batch")
+
+    if not stopped:
+        # --- Org-wide SMTP AUTH (run once at the end) ---
+        try:
+            rc = await loop.run_in_executor(
+                None,
+                run_pwsh_script,
+                _connect_block(cert_path, cert_pw, organization, app_id) + finalize,
+            )
+            if rc != 0:
+                _log(job_id, "warning", f"PowerShell exited with code {rc} during finalize")
+        except Exception as e:
+            _log(job_id, "error", f"PowerShell execution error during finalize: {e}")
     # ---------------------------------------------------------------------------
     # Graph fallback: if PowerShell password step failed, retry via Graph API.
     # This handles cases where Microsoft.Graph.Users PS module isn't installed
@@ -723,7 +806,11 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
                     _log(job_id, "error", f"[{i+1}/{len(assignments)}] Graph password failed: {last_err}")
 
     any_errors = any(per[i].get("error") for i in per)
-    job["status"] = "completed_with_errors" if any_errors else "completed"
+    if stopped:
+        job["status"] = "stopped"
+    else:
+        job["status"] = "completed_with_errors" if any_errors else "completed"
     job["finished_at"] = datetime.utcnow().isoformat() + "Z"
     job["results"] = [per[i] for i in range(len(assignments))]
+    job["control"] = None
     _log(job_id, "info", f"Job finished — status: {job['status']}")
