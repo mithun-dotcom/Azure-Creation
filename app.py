@@ -629,17 +629,28 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
     loop = asyncio.get_event_loop()
 
     def run_pwsh_stream() -> int:
-        proc = subprocess.Popen(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", full_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        for line in iter(proc.stdout.readline, ""):
-            handle(line)
-        proc.wait()
-        return proc.returncode
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(full_script)
+            script_path = f.name
+        try:
+            proc = subprocess.Popen(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in iter(proc.stdout.readline, ""):
+                handle(line)
+            proc.wait()
+            return proc.returncode
+        finally:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
 
     try:
         rc = await loop.run_in_executor(None, run_pwsh_stream)
