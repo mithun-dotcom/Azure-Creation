@@ -527,31 +527,55 @@ $smtp = '{ps_escape(smtp)}'
 $owner = '{ps_escape(owner)}'
 $pw = '{ps_escape(password)}'
 try {{
-    # --- Create shared mailbox ---
-    $mbx = New-Mailbox -Shared -Name '{ps_escape(m["DisplayName"])}' `
-        -DisplayName '{ps_escape(m["DisplayName"])}' `
-        -Alias '{ps_escape(m["Alias"])}' `
-        -PrimarySmtpAddress $smtp -ErrorAction Stop
-    Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName }})
+    # --- Create shared mailbox (or reuse existing) ---
+    $existing = Get-Mailbox -Identity $smtp -ErrorAction SilentlyContinue
+    if ($existing) {{
+        $mbx = $existing
+        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName; existing=$true }})
+    }} else {{
+        $mbx = New-Mailbox -Shared -Name '{ps_escape(m["DisplayName"])}' `
+            -DisplayName '{ps_escape(m["DisplayName"])}' `
+            -Alias '{ps_escape(m["Alias"])}' `
+            -PrimarySmtpAddress $smtp -ErrorAction Stop
+        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName; existing=$false }})
+    }}
 
     # --- Full Access ---
-    Add-MailboxPermission -Identity $smtp -User $owner `
-        -AccessRights FullAccess -InheritanceType All `
-        -AutoMapping $true -ErrorAction Stop | Out-Null
-    Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true }})
+    $hasFullAccess = (Get-MailboxPermission -Identity $smtp -User $owner -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.AccessRights -contains 'FullAccess' }}) -ne $null
+    if ($hasFullAccess) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    }} else {{
+        Add-MailboxPermission -Identity $smtp -User $owner `
+            -AccessRights FullAccess -InheritanceType All `
+            -AutoMapping $true -ErrorAction Stop | Out-Null
+        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
+    }}
 
     # --- Send As ---
-    Add-RecipientPermission -Identity $smtp -Trustee $owner `
-        -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
-    Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true }})
+    $hasSendAs = (Get-RecipientPermission -Identity $smtp -Trustee $owner -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.AccessRights -contains 'SendAs' }}) -ne $null
+    if ($hasSendAs) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    }} else {{
+        Add-RecipientPermission -Identity $smtp -Trustee $owner `
+            -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
+    }}
 
     # --- Send on Behalf ---
-    Set-Mailbox -Identity $smtp -GrantSendOnBehalfTo @{{ Add=$owner }} -ErrorAction Stop
-    Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true }})
+    $currentSendOnBehalf = @($mbx.GrantSendOnBehalfTo)
+    $hasSendOnBehalf = $currentSendOnBehalf -contains $owner
+    if ($hasSendOnBehalf) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    }} else {{
+        Set-Mailbox -Identity $smtp -GrantSendOnBehalfTo @{{ Add=$owner }} -ErrorAction Stop
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
+    }}
 
     # --- Password + enable sign-in via PowerShell ---
-    # Wait briefly for the account to fully propagate
-    Start-Sleep -Seconds 5
+    # Wait briefly for the account to fully propagate (only needed for newly created mailboxes)
+    if (-not $existing) {{ Start-Sleep -Seconds 5 }}
     if ($pw -ne '') {{
         $securePw = ConvertTo-SecureString -String $pw -AsPlainText -Force
         # Try Set-MsolUserPassword (MSOnline module) first
@@ -578,6 +602,10 @@ try {{
         }}
     }} else {{
         Write-Host (ConvertTo-Json -Compress @{{ stage='password'; idx=$idx; smtp=$smtp; ok=$false; error='no password in CSV' }})
+    }}
+
+    if ($existing -and $hasFullAccess -and $hasSendAs -and $hasSendOnBehalf) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='already-configured'; idx=$idx; smtp=$smtp; ok=$true }})
     }}
 }} catch {{
     Write-Host (ConvertTo-Json -Compress @{{ stage='error'; idx=$idx; smtp=$smtp; ok=$false; error=$_.Exception.Message }})
@@ -632,17 +660,31 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         if stage == "create" and isinstance(idx, int):
             per[idx]["create"] = "ok" if evt.get("ok") else "fail"
             per[idx]["upn"] = evt.get("upn")
-            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] mailbox created — {evt.get('smtp')}")
+            if evt.get("existing"):
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] mailbox already exists — {evt.get('smtp')}")
+            else:
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] mailbox created — {evt.get('smtp')}")
         elif stage == "fullaccess" and isinstance(idx, int):
             per[idx]["fullaccess"] = "ok"
-            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] full access → {per[idx]['owner']}")
+            if evt.get("skipped"):
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] full access already set → {per[idx]['owner']}")
+            else:
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] full access → {per[idx]['owner']}")
         elif stage == "sendas" and isinstance(idx, int):
             per[idx]["sendas"] = "ok"
-            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send as → {per[idx]['owner']}")
+            if evt.get("skipped"):
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send as already set → {per[idx]['owner']}")
+            else:
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send as → {per[idx]['owner']}")
         elif stage == "sendonbehalf" and isinstance(idx, int):
             per[idx]["sendonbehalf"] = "ok"
-            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send-on-behalf → {per[idx]['owner']}")
+            if evt.get("skipped"):
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send-on-behalf already set → {per[idx]['owner']}")
+            else:
+                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send-on-behalf → {per[idx]['owner']}")
             job["completed"] = job["completed"] + 1
+        elif stage == "already-configured" and isinstance(idx, int):
+            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] all settings already set up — {evt.get('smtp')}")
         elif stage == "password" and isinstance(idx, int):
             if evt.get("ok"):
                 per[idx]["passwordSet"] = "ok"
