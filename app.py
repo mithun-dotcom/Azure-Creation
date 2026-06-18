@@ -6,7 +6,7 @@ Single-file FastAPI app that:
   - Lists licensed users via Microsoft Graph
   - Bulk-creates shared mailboxes via Exchange Online PowerShell
   - Grants Full Access + Send-on-Behalf to a chosen licensed user
-  - Sets password and unblocks sign-in via PowerShell (Set-MsolUserPassword / MSOnline)
+  - Sets a password and unblocks sign-in on each shared mailbox (via Graph)
   - Flips the org-wide "Turn off SMTP AUTH" checkbox to unchecked (enables SMTP AUTH)
 
 Deploy on Render using the supplied Dockerfile (which installs pwsh and the
@@ -67,6 +67,7 @@ async def _cleanup_loop() -> None:
         except asyncio.CancelledError:
             break
         except Exception:
+            # Don't let the loop die on transient errors
             await asyncio.sleep(5)
 
 
@@ -81,6 +82,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Shared Mailbox Provisioner", lifespan=lifespan)
 
+# CORS — restrict to your Netlify origin in production via env var
 _allowed = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -110,10 +112,16 @@ async def get_graph_token(tenant_id: str, client_id: str, client_secret: str) ->
     return r.json()["access_token"]
 
 
+# ---------------------------------------------------------------------------
+# NEW: resolve Tenant GUID → .onmicrosoft.com domain for Connect-ExchangeOnline
+# ---------------------------------------------------------------------------
+
 async def get_tenant_domain(token: str) -> str:
     """
-    Exchange Online's -Organization parameter requires the tenant domain name
-    (e.g. contoso.onmicrosoft.com), NOT the directory GUID.
+    Exchange Online's -Organization parameter requires the tenant's primary
+    domain name (e.g. contoso.onmicrosoft.com), NOT the directory GUID.
+    This function looks it up automatically via Graph so the user never has
+    to enter it manually.
     """
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
@@ -124,13 +132,29 @@ async def get_tenant_domain(token: str) -> str:
     if r.status_code >= 400:
         raise HTTPException(r.status_code, f"Graph /organization error: {r.text}")
     domains = r.json()["value"][0]["verifiedDomains"]
+    # Prefer the default .onmicrosoft.com domain
     for d in domains:
         if d["name"].endswith(".onmicrosoft.com") and d.get("isDefault"):
             return d["name"]
+    # Fallback: any .onmicrosoft.com domain
     for d in domains:
         if d["name"].endswith(".onmicrosoft.com"):
             return d["name"]
     raise HTTPException(400, "Could not find .onmicrosoft.com domain for this tenant")
+
+
+async def graph_patch(token: str, path: str, body: dict) -> None:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.patch(
+            f"{GRAPH_BASE}{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"Graph PATCH {path}: {r.text}")
 
 
 async def list_licensed_users(token: str) -> List[dict]:
@@ -181,10 +205,9 @@ def ps_escape(s: str) -> str:
 
 
 def _connect_block(cert_path: str, cert_password: str, organization: str, app_id: str) -> str:
-    """
-    Connect to Exchange Online using certificate auth.
-    -Organization must be the tenant domain name, NOT the GUID.
-    """
+    # NOTE: -Organization must be the tenant domain (e.g. contoso.onmicrosoft.com),
+    # NOT the directory GUID. Pass `organization` (resolved via get_tenant_domain),
+    # never the raw tenantId GUID.
     return f"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -231,6 +254,7 @@ def root():
 
 @app.get("/api/health")
 def health():
+    # Verify pwsh is callable
     try:
         rc, out, err = run_pwsh("$PSVersionTable.PSVersion.ToString()", timeout=10)
         pwsh_version = out.strip() if rc == 0 else None
@@ -253,10 +277,10 @@ async def create_session(
     certFile: UploadFile = File(...),
 ):
     """
-    Validate credentials end-to-end:
-      1. Acquire Graph token
-      2. Resolve tenant GUID → .onmicrosoft.com domain
-      3. Test Exchange Online connection with cert
+    Validate credentials end-to-end by:
+      1. Acquiring a Graph token (verifies client secret + tenant + app ID)
+      2. Resolving the tenant GUID → .onmicrosoft.com domain via Graph
+      3. Opening + closing an Exchange Online session (verifies cert + Exchange role)
     """
     cert_bytes = await certFile.read()
     if not cert_bytes:
@@ -271,6 +295,8 @@ async def create_session(
         os.remove(cert_path)
         raise
 
+    # Resolve the tenant domain — Exchange Online requires the domain name,
+    # not the GUID, in the -Organization parameter.
     try:
         organization = await get_tenant_domain(gt)
     except HTTPException:
@@ -287,6 +313,7 @@ async def create_session(
     if rc != 0:
         os.remove(cert_path)
         msg = (err or out).strip()
+        # Trim very long PowerShell tracebacks
         if len(msg) > 1500:
             msg = msg[:1500] + "…"
         raise HTTPException(401, f"Exchange Online connect failed: {msg}")
@@ -294,7 +321,7 @@ async def create_session(
     token = secrets.token_urlsafe(32)
     SESSIONS[token] = {
         "tenant_id": tenantId,
-        "organization": organization,
+        "organization": organization,   # resolved domain, used for EXO connections
         "client_id": clientId,
         "client_secret": clientSecret,
         "cert_password": certPassword,
@@ -342,6 +369,7 @@ async def start_job(token: str, body: JobRequest, background_tasks: BackgroundTa
     if not body.mailboxes:
         raise HTTPException(400, "No mailboxes to create.")
 
+    # Build assignment list: each mailbox row -> owner UPN
     assignments: List[dict] = []
     idx = 0
     for entry in body.distribution:
@@ -353,7 +381,6 @@ async def start_job(token: str, body: JobRequest, background_tasks: BackgroundTa
     JOBS[job_id] = {
         "id": job_id,
         "status": "queued",
-        "control": None,
         "logs": [],
         "results": [],
         "total": len(assignments),
@@ -376,87 +403,47 @@ def get_job(token: str, job_id: str):
 
 
 @app.get("/api/session/{token}/job/{job_id}/report")
-def get_job_report(token: str, job_id: str, includePassword: int = 0):
+def get_job_report(token: str, job_id: str):
     get_session(token)
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     out = io.StringIO()
     w = csv.writer(out)
-    header = [
-        "Index",
-        "PrimarySmtpAddress",
-        "AssignedOwner",
-        "Created",
-        "FullAccess",
-        "SendAs",
-        "SendOnBehalf",
-        "SignInUnblocked",
-        "PasswordSet",
-        "Error",
-    ]
-    if includePassword:
-        header.append("Password")
-    w.writerow(header)
-    for r in job.get("results", []):
-        row = [
-            r.get("idx"),
-            r.get("smtp", ""),
-            r.get("owner", ""),
-            r.get("create") or "",
-            r.get("fullaccess") or "",
-            r.get("sendas") or "",
-            r.get("sendonbehalf") or "",
-            r.get("signinUnblocked") or "",
-            r.get("passwordSet") or "",
-            r.get("error") or "",
+    w.writerow(
+        [
+            "Index",
+            "PrimarySmtpAddress",
+            "AssignedOwner",
+            "Created",
+            "FullAccess",
+            "SendAs",
+            "SendOnBehalf",
+            "SignInUnblocked",
+            "PasswordSet",
+            "Error",
         ]
-        if includePassword:
-            row.append(r.get("password") or "")
-        w.writerow(row)
-    suffix = "-with-passwords" if includePassword else ""
+    )
+    for r in job.get("results", []):
+        w.writerow(
+            [
+                r.get("idx"),
+                r.get("smtp", ""),
+                r.get("owner", ""),
+                r.get("create") or "",
+                r.get("fullaccess") or "",
+                r.get("sendas") or "",
+                r.get("sendonbehalf") or "",
+                r.get("signinUnblocked") or "",
+                r.get("passwordSet") or "",
+                r.get("error") or "",
+            ]
+        )
     return Response(
         content=out.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=mailbox-job-{job_id}{suffix}.csv"},
+        headers={"Content-Disposition": f"attachment; filename=mailbox-job-{job_id}.csv"},
     )
-
-
-@app.post("/api/session/{token}/job/{job_id}/pause")
-def pause_job(token: str, job_id: str):
-    get_session(token)
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    if job["status"] not in ("queued", "running"):
-        raise HTTPException(400, f"Cannot pause job in status '{job['status']}'")
-    job["control"] = "pause"
-    return {"status": "pause-requested"}
-
-
-@app.post("/api/session/{token}/job/{job_id}/resume")
-def resume_job(token: str, job_id: str):
-    get_session(token)
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    if job["status"] != "paused":
-        raise HTTPException(400, f"Cannot resume job in status '{job['status']}'")
-    job["control"] = "resume"
-    job["status"] = "running"
-    return {"status": "resumed"}
-
-
-@app.post("/api/session/{token}/job/{job_id}/stop")
-def stop_job(token: str, job_id: str):
-    get_session(token)
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    if job["status"] not in ("queued", "running", "paused"):
-        raise HTTPException(400, f"Cannot stop job in status '{job['status']}'")
-    job["control"] = "stop"
-    return {"status": "stop-requested"}
 
 
 # ---------------------------------------------------------------------------
@@ -504,108 +491,64 @@ async def _run_job(job_id: str, assignments: List[dict]) -> None:
     cert_path = sess["cert_path"]
     cert_pw = sess["cert_password"]
     tenant = sess["tenant_id"]
-    organization = sess["organization"]
+    organization = sess["organization"]   # domain name, not GUID
     app_id = sess["client_id"]
+    secret = sess["client_secret"]
 
-    # ---------------------------------------------------------------------------
-    # Build PowerShell script:
-    # Phase 1 — create mailbox, set permissions (Exchange Online)
-    # Phase 2 — set password + enable sign-in via Set-AzureADUser (MSOnline/AzureAD)
-    #            falling back to Update-MgUser (Microsoft.Graph) if available
-    # Phase 3 — enable org-wide SMTP AUTH
-    # All in ONE PowerShell session to avoid reconnection overhead.
-    # ---------------------------------------------------------------------------
-
-    def build_action(i: int, a: dict) -> str:
+    # Build per-mailbox PowerShell actions
+    actions = ""
+    for i, a in enumerate(assignments):
         m = _normalize_row(a["mailbox"])
         owner = a["owner"]
         smtp = m["PrimarySmtpAddress"]
-        password = m["Password"]
-        return f"""
+        if not smtp:
+            _log(job_id, "error", f"[{i+1}] CSV row missing PrimarySmtpAddress — skipped")
+            continue
+        actions += f"""
 $idx = {i}
 $smtp = '{ps_escape(smtp)}'
 $owner = '{ps_escape(owner)}'
-$pw = '{ps_escape(password)}'
 try {{
-    # --- Create shared mailbox (or reuse existing) ---
-    $existing = Get-Mailbox -Identity $smtp -ErrorAction SilentlyContinue
-    if ($existing) {{
-        $mbx = $existing
-        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName; existing=$true }})
+    # ---- Step 1: create mailbox (skip if it already exists) ----
+    $existingMbx = Get-Mailbox -Identity $smtp -ErrorAction SilentlyContinue
+    if ($existingMbx) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; existed=$true; userId=$existingMbx.ExternalDirectoryObjectId; upn=$existingMbx.UserPrincipalName }})
     }} else {{
         $mbx = New-Mailbox -Shared -Name '{ps_escape(m["Alias"])}' -DisplayName '{ps_escape(m["DisplayName"])}' -Alias '{ps_escape(m["Alias"])}' -PrimarySmtpAddress $smtp -ErrorAction Stop
-            -DisplayName '{ps_escape(m["DisplayName"])}' `
-            -Alias '{ps_escape(m["Alias"])}' `
-            -PrimarySmtpAddress $smtp -ErrorAction Stop
-        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName; existing=$false }})
+        Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; existed=$false; userId=$mbx.ExternalDirectoryObjectId; upn=$mbx.UserPrincipalName }})
     }}
 
-    # --- Full Access ---
-    $hasFullAccess = (Get-MailboxPermission -Identity $smtp -User $owner -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.AccessRights -contains 'FullAccess' }}) -ne $null
-    if ($hasFullAccess) {{
-        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    # ---- Step 2: grant Full Access (skip if already granted) ----
+    $existingFA = Get-MailboxPermission -Identity $smtp -User $owner -ErrorAction SilentlyContinue | Where-Object {{ ($_.AccessRights -contains 'FullAccess') -and (-not $_.IsInherited) }}
+    if ($existingFA) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; existed=$true }})
     }} else {{
-        Add-MailboxPermission -Identity $smtp -User $owner `
-            -AccessRights FullAccess -InheritanceType All `
-            -AutoMapping $true -ErrorAction Stop | Out-Null
-        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
+        Add-MailboxPermission -Identity $smtp -User $owner -AccessRights FullAccess -InheritanceType All -AutoMapping $true -ErrorAction Stop | Out-Null
+        Write-Host (ConvertTo-Json -Compress @{{ stage='fullaccess'; idx=$idx; smtp=$smtp; ok=$true; existed=$false }})
     }}
 
-    # --- Send As ---
-    $hasSendAs = (Get-RecipientPermission -Identity $smtp -Trustee $owner -ErrorAction SilentlyContinue |
-        Where-Object {{ $_.AccessRights -contains 'SendAs' }}) -ne $null
-    if ($hasSendAs) {{
-        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    # ---- Step 3: grant Send As (skip if already granted) ----
+    $existingSA = Get-RecipientPermission -Identity $smtp -Trustee $owner -ErrorAction SilentlyContinue | Where-Object {{ $_.AccessRights -contains 'SendAs' }}
+    if ($existingSA) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; existed=$true }})
     }} else {{
-        Add-RecipientPermission -Identity $smtp -Trustee $owner `
-            -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
-        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
+        Add-RecipientPermission -Identity $smtp -Trustee $owner -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendas'; idx=$idx; smtp=$smtp; ok=$true; existed=$false }})
     }}
 
-    # --- Send on Behalf ---
-    $currentSendOnBehalf = @($mbx.GrantSendOnBehalfTo)
-    $hasSendOnBehalf = $currentSendOnBehalf -contains $owner
-    if ($hasSendOnBehalf) {{
-        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; skipped=$true }})
+    # ---- Step 4: grant Send-on-Behalf (skip if already granted) ----
+    $mbxNow = Get-Mailbox -Identity $smtp
+    $alreadyOnBehalf = $false
+    if ($mbxNow.GrantSendOnBehalfTo) {{
+        foreach ($r in $mbxNow.GrantSendOnBehalfTo) {{
+            if ("$r" -like "*$owner*") {{ $alreadyOnBehalf = $true; break }}
+        }}
+    }}
+    if ($alreadyOnBehalf) {{
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; existed=$true }})
     }} else {{
         Set-Mailbox -Identity $smtp -GrantSendOnBehalfTo @{{ Add=$owner }} -ErrorAction Stop
-        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; skipped=$false }})
-    }}
-
-    # --- Password + enable sign-in via PowerShell ---
-    # Wait briefly for the account to fully propagate (only needed for newly created mailboxes)
-    if (-not $existing) {{ Start-Sleep -Seconds 5 }}
-    if ($pw -ne '') {{
-        $securePw = ConvertTo-SecureString -String $pw -AsPlainText -Force
-        # Try Set-MsolUserPassword (MSOnline module) first
-        $msolAvail = Get-Module -ListAvailable -Name MSOnline
-        if ($msolAvail) {{
-            Import-Module MSOnline -ErrorAction SilentlyContinue
-            $msolCred = $null  # App-only; MSOnline needs user cred — skip
-        }}
-        # Use Microsoft.Graph module (Update-MgUser) — app-only supported
-        $mgAvail = Get-Module -ListAvailable -Name Microsoft.Graph.Users
-        if ($mgAvail) {{
-            Import-Module Microsoft.Graph.Users -ErrorAction SilentlyContinue
-            Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
-            $upn = $mbx.UserPrincipalName
-            $pwProfile = @{{
-                Password = $pw
-                ForceChangePasswordNextSignIn = $false
-            }}
-            Update-MgUser -UserId $upn -PasswordProfile $pwProfile -AccountEnabled:$true -ErrorAction Stop
-            Write-Host (ConvertTo-Json -Compress @{{ stage='password'; idx=$idx; smtp=$smtp; ok=$true }})
-        }} else {{
-            # Fallback: Set-User doesn't set passwords, flag for Graph retry
-            Write-Host (ConvertTo-Json -Compress @{{ stage='password'; idx=$idx; smtp=$smtp; ok=$false; error='Microsoft.Graph.Users module not available' }})
-        }}
-    }} else {{
-        Write-Host (ConvertTo-Json -Compress @{{ stage='password'; idx=$idx; smtp=$smtp; ok=$false; error='no password in CSV' }})
-    }}
-
-    if ($existing -and $hasFullAccess -and $hasSendAs -and $hasSendOnBehalf) {{
-        Write-Host (ConvertTo-Json -Compress @{{ stage='already-configured'; idx=$idx; smtp=$smtp; ok=$true }})
+        Write-Host (ConvertTo-Json -Compress @{{ stage='sendonbehalf'; idx=$idx; smtp=$smtp; ok=$true; existed=$false }})
     }}
 }} catch {{
     Write-Host (ConvertTo-Json -Compress @{{ stage='error'; idx=$idx; smtp=$smtp; ok=$false; error=$_.Exception.Message }})
@@ -613,7 +556,6 @@ try {{
 """
 
     finalize = """
-# --- Org-wide SMTP AUTH ---
 try {
     Set-TransportConfig -SmtpClientAuthenticationDisabled $false -ErrorAction Stop
     Write-Host (ConvertTo-Json -Compress @{ stage='org-smtpauth'; ok=$true })
@@ -623,6 +565,8 @@ try {
 Disconnect-ExchangeOnline -Confirm:$false | Out-Null
 """
 
+    full_script = _connect_block(cert_path, cert_pw, organization, app_id) + actions + finalize
+
     # Per-mailbox state tracker
     per: Dict[int, dict] = {
         i: {
@@ -631,8 +575,8 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
             "upn": None,
             "userId": None,
             "owner": a["owner"],
-            "password": _normalize_row(a["mailbox"]).get("Password", ""),
             "create": None,
+            "existed": False,
             "fullaccess": None,
             "sendas": None,
             "sendonbehalf": None,
@@ -659,41 +603,32 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         idx = evt.get("idx")
         if stage == "create" and isinstance(idx, int):
             per[idx]["create"] = "ok" if evt.get("ok") else "fail"
+            per[idx]["userId"] = evt.get("userId")
             per[idx]["upn"] = evt.get("upn")
-            if evt.get("existing"):
+            per[idx]["existed"] = bool(evt.get("existed"))
+            if evt.get("existed"):
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] mailbox already exists — {evt.get('smtp')}")
             else:
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] mailbox created — {evt.get('smtp')}")
         elif stage == "fullaccess" and isinstance(idx, int):
             per[idx]["fullaccess"] = "ok"
-            if evt.get("skipped"):
+            if evt.get("existed"):
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] full access already set → {per[idx]['owner']}")
             else:
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] full access → {per[idx]['owner']}")
         elif stage == "sendas" and isinstance(idx, int):
             per[idx]["sendas"] = "ok"
-            if evt.get("skipped"):
+            if evt.get("existed"):
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send as already set → {per[idx]['owner']}")
             else:
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send as → {per[idx]['owner']}")
         elif stage == "sendonbehalf" and isinstance(idx, int):
             per[idx]["sendonbehalf"] = "ok"
-            if evt.get("skipped"):
+            if evt.get("existed"):
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send-on-behalf already set → {per[idx]['owner']}")
             else:
                 _log(job_id, "info", f"[{idx+1}/{len(assignments)}] send-on-behalf → {per[idx]['owner']}")
             job["completed"] = job["completed"] + 1
-        elif stage == "already-configured" and isinstance(idx, int):
-            _log(job_id, "info", f"[{idx+1}/{len(assignments)}] all settings already set up — {evt.get('smtp')}")
-        elif stage == "password" and isinstance(idx, int):
-            if evt.get("ok"):
-                per[idx]["passwordSet"] = "ok"
-                per[idx]["signinUnblocked"] = "ok"
-                _log(job_id, "info", f"[{idx+1}/{len(assignments)}] password set & sign-in enabled — {evt.get('smtp')}")
-            else:
-                err = evt.get("error", "unknown")
-                per[idx]["passwordSet"] = "fail"
-                _log(job_id, "warning", f"[{idx+1}/{len(assignments)}] password step: {err}")
         elif stage == "error" and isinstance(idx, int):
             per[idx]["error"] = evt.get("error")
             _log(job_id, "error", f"[{idx+1}/{len(assignments)}] {evt.get('error')}")
@@ -705,154 +640,105 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
 
     loop = asyncio.get_event_loop()
 
-    def run_pwsh_script(script: str) -> int:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".ps1", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(script)
-            script_path = f.name
-        try:
-            proc = subprocess.Popen(
-                ["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            for line in iter(proc.stdout.readline, ""):
-                handle(line)
-            proc.wait()
-            return proc.returncode
-        finally:
-            try:
-                os.unlink(script_path)
-            except OSError:
-                pass
+    def run_pwsh_stream() -> int:
+        proc = subprocess.Popen(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", full_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in iter(proc.stdout.readline, ""):
+            handle(line)
+        proc.wait()
+        return proc.returncode
 
-    CHUNK_SIZE = 5
-    valid_indices = [i for i, a in enumerate(assignments) if per[i]["smtp"]]
+    try:
+        rc = await loop.run_in_executor(None, run_pwsh_stream)
+    except Exception as e:
+        _log(job_id, "error", f"PowerShell execution error: {e}")
+        job["status"] = "failed"
+        job["finished_at"] = datetime.utcnow().isoformat() + "Z"
+        return
+
+    if rc != 0:
+        _log(job_id, "warning", f"PowerShell exited with code {rc}")
+
+    # Graph phase: set password + unblock sign-in
+    _log(job_id, "info", "Setting passwords and unblocking sign-in via Graph…")
+    try:
+        gt = await get_graph_token(tenant, app_id, secret)
+    except HTTPException as e:
+        _log(job_id, "error", f"Graph token error: {e.detail}")
+        job["status"] = "failed"
+        job["finished_at"] = datetime.utcnow().isoformat() + "Z"
+        return
+
     for i, a in enumerate(assignments):
-        if not per[i]["smtp"]:
-            _log(job_id, "error", f"[{i+1}] CSV row missing PrimarySmtpAddress — skipped")
-
-    stopped = False
-    for chunk_start in range(0, len(valid_indices), CHUNK_SIZE):
-        chunk = valid_indices[chunk_start:chunk_start + CHUNK_SIZE]
-
-        # Check for pause/stop before starting this chunk
-        while True:
-            ctl = job.get("control")
-            if ctl == "stop":
-                stopped = True
-                _log(job_id, "warning", "Job stopped by user")
-                break
-            if ctl == "pause":
-                if job["status"] != "paused":
-                    job["status"] = "paused"
-                    _log(job_id, "info", "Job paused")
-                await asyncio.sleep(1)
-                continue
-            if job["status"] == "paused":
-                job["status"] = "running"
-                _log(job_id, "info", "Job resumed")
-            job["control"] = None
-            break
-
-        if stopped:
-            break
-
-        actions = "".join(build_action(i, assignments[i]) for i in chunk)
-        chunk_script = _connect_block(cert_path, cert_pw, organization, app_id) + actions + "Disconnect-ExchangeOnline -Confirm:$false | Out-Null\n"
-
-        try:
-            rc = await loop.run_in_executor(None, run_pwsh_script, chunk_script)
-        except Exception as e:
-            _log(job_id, "error", f"PowerShell execution error: {e}")
-            for i in chunk:
-                if not per[i]["error"]:
-                    per[i]["error"] = str(e)
+        st = per[i]
+        if st["create"] != "ok":
+            continue
+        password = _normalize_row(a["mailbox"]).get("Password", "")
+        user_ref = st["userId"] or st["upn"] or st["smtp"]
+        if not password:
+            _log(job_id, "warning", f"[{i+1}/{len(assignments)}] no password in CSV — skipping")
             continue
 
-        if rc != 0:
-            _log(job_id, "warning", f"PowerShell exited with code {rc} for this batch")
-
-    if not stopped:
-        # --- Org-wide SMTP AUTH (run once at the end) ---
-        try:
-            rc = await loop.run_in_executor(
-                None,
-                run_pwsh_script,
-                _connect_block(cert_path, cert_pw, organization, app_id) + finalize,
-            )
-            if rc != 0:
-                _log(job_id, "warning", f"PowerShell exited with code {rc} during finalize")
-        except Exception as e:
-            _log(job_id, "error", f"PowerShell execution error during finalize: {e}")
-    # ---------------------------------------------------------------------------
-    # Graph fallback: if PowerShell password step failed, retry via Graph API.
-    # This handles cases where Microsoft.Graph.Users PS module isn't installed
-    # on the Render container but the app has User.ReadWrite.All permission.
-    # ---------------------------------------------------------------------------
-    needs_graph_retry = [
-        i for i, p in per.items()
-        if p["create"] == "ok" and p["passwordSet"] != "ok"
-    ]
-
-    if needs_graph_retry:
-        _log(job_id, "info", f"Retrying password via Graph API for {len(needs_graph_retry)} mailbox(es)…")
-        try:
-            gt = await get_graph_token(tenant, app_id, sess["client_secret"])
-        except HTTPException as e:
-            _log(job_id, "error", f"Graph token error: {e.detail}")
-            gt = None
-
-        if gt:
-            for i in needs_graph_retry:
-                st = per[i]
-                password = _normalize_row(assignments[i]["mailbox"]).get("Password", "")
-                user_ref = st["upn"] or st["smtp"]
-                if not password:
+        # If the mailbox already existed AND the underlying user account is already
+        # enabled, assume the password was already set on a previous run and skip.
+        if st.get("existed"):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    rr = await client.get(
+                        f"{GRAPH_BASE}/users/{user_ref}?$select=accountEnabled",
+                        headers={"Authorization": f"Bearer {gt}"},
+                    )
+                if rr.status_code == 200 and rr.json().get("accountEnabled"):
+                    st["signinUnblocked"] = "ok"
+                    st["passwordSet"] = "skipped"
+                    _log(
+                        job_id,
+                        "info",
+                        f"[{i+1}/{len(assignments)}] sign-in already enabled — {st['smtp']}",
+                    )
                     continue
+            except Exception:
+                # If the check fails, fall through and try the PATCH anyway
+                pass
 
-                last_err: Optional[str] = None
-                for attempt in range(4):
-                    try:
-                        async with httpx.AsyncClient(timeout=60) as client:
-                            r = await client.patch(
-                                f"{GRAPH_BASE}/users/{user_ref}",
-                                headers={
-                                    "Authorization": f"Bearer {gt}",
-                                    "Content-Type": "application/json",
-                                },
-                                json={
-                                    "accountEnabled": True,
-                                    "passwordProfile": {
-                                        "password": password,
-                                        "forceChangePasswordNextSignIn": False,
-                                    },
-                                },
-                            )
-                        if r.status_code >= 400:
-                            raise HTTPException(r.status_code, r.text)
-                        st["passwordSet"] = "ok"
-                        st["signinUnblocked"] = "ok"
-                        _log(job_id, "info", f"[{i+1}/{len(assignments)}] Graph: password set & sign-in enabled — {st['smtp']}")
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = str(e)
-                        await asyncio.sleep(2 + attempt * 2)
-
-                if last_err:
-                    st["error"] = (st["error"] + " | " if st["error"] else "") + f"Graph: {last_err}"
-                    _log(job_id, "error", f"[{i+1}/{len(assignments)}] Graph password failed: {last_err}")
+        # Brief retry — newly-created user can take a moment to be visible in Graph
+        last_err: Optional[str] = None
+        for attempt in range(4):
+            try:
+                await graph_patch(
+                    gt,
+                    f"/users/{user_ref}",
+                    {
+                        "accountEnabled": True,
+                        "passwordProfile": {
+                            "password": password,
+                            "forceChangePasswordNextSignIn": False,
+                        },
+                    },
+                )
+                st["signinUnblocked"] = "ok"
+                st["passwordSet"] = "ok"
+                _log(
+                    job_id,
+                    "info",
+                    f"[{i+1}/{len(assignments)}] sign-in unblocked & password set — {st['smtp']}",
+                )
+                last_err = None
+                break
+            except HTTPException as e:
+                last_err = str(e.detail)
+                await asyncio.sleep(2 + attempt * 2)
+        if last_err:
+            st["error"] = (st["error"] + " | " if st["error"] else "") + f"Graph: {last_err}"
+            _log(job_id, "error", f"[{i+1}/{len(assignments)}] Graph update failed: {last_err}")
 
     any_errors = any(per[i].get("error") for i in per)
-    if stopped:
-        job["status"] = "stopped"
-    else:
-        job["status"] = "completed_with_errors" if any_errors else "completed"
+    job["status"] = "completed_with_errors" if any_errors else "completed"
     job["finished_at"] = datetime.utcnow().isoformat() + "Z"
     job["results"] = [per[i] for i in range(len(assignments))]
-    job["control"] = None
     _log(job_id, "info", f"Job finished — status: {job['status']}")
