@@ -641,17 +641,29 @@ Disconnect-ExchangeOnline -Confirm:$false | Out-Null
     loop = asyncio.get_event_loop()
 
     def run_pwsh_stream() -> int:
-        proc = subprocess.Popen(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", full_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        for line in iter(proc.stdout.readline, ""):
-            handle(line)
-        proc.wait()
-        return proc.returncode
+        # Write the script to a temp .ps1 file and run it with -File.
+        # This avoids the OS "argument list too long" (Errno 7) limit when
+        # the script gets large (e.g. 99+ mailboxes × idempotency checks).
+        fd, script_path = tempfile.mkstemp(suffix=".ps1", prefix="mp_job_")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(full_script)
+            proc = subprocess.Popen(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in iter(proc.stdout.readline, ""):
+                handle(line)
+            proc.wait()
+            return proc.returncode
+        finally:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
 
     try:
         rc = await loop.run_in_executor(None, run_pwsh_stream)
