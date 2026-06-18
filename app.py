@@ -533,7 +533,7 @@ try {{
         $mbx = $existing
         Write-Host (ConvertTo-Json -Compress @{{ stage='create'; idx=$idx; smtp=$smtp; ok=$true; upn=$mbx.UserPrincipalName; existing=$true }})
     }} else {{
-        $mbx = New-Mailbox -Shared -Name '{ps_escape(m["DisplayName"])}' `
+        $mbx = New-Mailbox -Shared -Name '{ps_escape(m["Alias"])}' -DisplayName '{ps_escape(m["DisplayName"])}' -Alias '{ps_escape(m["Alias"])}' -PrimarySmtpAddress $smtp -ErrorAction Stop
             -DisplayName '{ps_escape(m["DisplayName"])}' `
             -Alias '{ps_escape(m["Alias"])}' `
             -PrimarySmtpAddress $smtp -ErrorAction Stop
